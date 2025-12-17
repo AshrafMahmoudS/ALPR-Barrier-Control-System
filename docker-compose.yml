@@ -1,0 +1,153 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: alpr_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-alpr_system}
+      POSTGRES_USER: ${POSTGRES_USER:-alpr_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d
+    networks:
+      - alpr_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-alpr_admin} -d ${POSTGRES_DB:-alpr_system}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: alpr_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - alpr_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile
+    container_name: alpr_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./backend:/app
+      - ${IMAGE_STORAGE_PATH:-./storage/images}:/var/alpr-system/images
+      - ${LOG_FILE_PATH:-./logs}:/var/log/alpr-system
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - alpr_network
+    working_dir: /app
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  alpr-service:
+    build:
+      context: ./alpr-service
+      dockerfile: ../docker/alpr-service/Dockerfile
+    container_name: alpr_service
+    restart: unless-stopped
+    env_file:
+      - .env
+    privileged: true
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+    volumes:
+      - ./alpr-service:/app
+      - ${IMAGE_STORAGE_PATH:-./storage/images}:/var/alpr-system/images
+    depends_on:
+      - redis
+      - backend
+    networks:
+      - alpr_network
+
+  hardware-controller:
+    build:
+      context: ./hardware-controller
+      dockerfile: ../docker/hardware-controller/Dockerfile
+    container_name: alpr_hardware
+    restart: unless-stopped
+    env_file:
+      - .env
+    privileged: true
+    volumes:
+      - ./hardware-controller:/app
+      - /sys:/sys
+    depends_on:
+      - redis
+      - backend
+    networks:
+      - alpr_network
+    # Only run on Raspberry Pi/Orange Pi with GPIO
+    profiles:
+      - production
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/frontend/Dockerfile
+      target: development
+    container_name: alpr_frontend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - alpr_network
+
+  nginx:
+    image: nginx:alpine
+    container_name: alpr_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - alpr_network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  alpr_network:
+    driver: bridge
